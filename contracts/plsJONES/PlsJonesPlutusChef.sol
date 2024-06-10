@@ -1,57 +1,54 @@
-// SPDX-License-Identifier: MIT
-pragma solidity 0.8.9;
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.17;
 
+import '@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol';
+import '@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol';
+import '@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol';
+import '@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol';
 import '@openzeppelin/contracts/token/ERC20/IERC20.sol';
-import '@openzeppelin/contracts/access/Ownable.sol';
-import { IRewardsDistro } from './PlsJonesRewardsDistro.sol';
-import { IWhitelist } from '../Whitelist.sol';
+import { IWhitelist } from '../misc/Whitelist.sol';
+import { IPlsJonesRewardsDistro, IPlsJonesPlutusChef } from './Interfaces.sol';
 
-/**
-  Assumptions:
-  Total stake: <= 309_485_009 * 1e18 tokens
-  Individual stake: <= 309_485_009 * 1e18 tokens
-  DPX max supply: 5e23
-  JONES max siupply: 1e25
-  PLS max supply: 1e26
- */
-contract PlsJonesPlutusChef is Ownable {
-  uint256 private constant MUL_CONSTANT = 1e14;
-  IRewardsDistro public immutable rewardsDistro;
-  IERC20 public immutable plsJones;
-
-  // Info of each user.
+contract PlsJonesPlutusChef is
+  Initializable,
+  PausableUpgradeable,
+  Ownable2StepUpgradeable,
+  UUPSUpgradeable,
+  IPlsJonesPlutusChef
+{
   struct UserInfo {
-    uint96 amount; // Staking tokens the user has provided
-    int128 plsRewardDebt;
-    int128 plsDpxRewardDebt;
-    int128 plsJonesRewardDebt;
-    int128 jonesRewardDebt;
+    uint96 amount;
+    int128 gxpRewardDebt;
+    int128 grailRewardDebt;
   }
 
+  uint256 private constant MUL_CONSTANT = 1e24;
+  // * plsJones
+  IERC20 public constant STAKING_TOKEN = IERC20(0xe7f6C3c1F0018E4C08aCC52965e5cbfF99e34A44);
+
+  uint128 public acc_gxp_PerShare;
+  uint128 public acc_grail_PerShare;
+  uint96 public shares;
+
   IWhitelist public whitelist;
-  address public operator;
-
-  uint128 public accPlsPerShare;
-  uint96 private shares; // total staked
-  uint32 public lastRewardSecond;
-
-  // Treasury
-  uint128 public accPlsDpxPerShare;
-  uint128 public accPlsJonesPerShare;
-
-  // Farm
-  uint128 public accJonesPerShare;
-
+  IPlsJonesRewardsDistro public distro;
   mapping(address => UserInfo) public userInfo;
+  mapping(address => bool) private handlers;
 
-  constructor(address _rewardsDistro, address _plsJones) {
-    rewardsDistro = IRewardsDistro(_rewardsDistro);
-    plsJones = IERC20(_plsJones);
+  /// @custom:oz-upgrades-unsafe-allow constructor
+  constructor() {
+    _disableInitializers();
+  }
+
+  function initialize() public initializer {
+    __Pausable_init();
+    __Ownable2Step_init();
+    __UUPSUpgradeable_init();
   }
 
   function deposit(uint96 _amount) external {
     _isEligibleSender();
-    _deposit(msg.sender, _amount);
+    _deposit(msg.sender, msg.sender, _amount);
   }
 
   function withdraw(uint96 _amount) external {
@@ -64,9 +61,6 @@ contract PlsJonesPlutusChef is Ownable {
     _harvest(msg.sender);
   }
 
-  /**
-   * Withdraw without caring about rewards. EMERGENCY ONLY.
-   */
   function emergencyWithdraw() external {
     _isEligibleSender();
     UserInfo storage user = userInfo[msg.sender];
@@ -74,7 +68,8 @@ contract PlsJonesPlutusChef is Ownable {
     uint96 _amount = user.amount;
 
     user.amount = 0;
-    user.plsRewardDebt = 0;
+    user.gxpRewardDebt = 0;
+    user.grailRewardDebt = 0;
 
     if (shares >= _amount) {
       shares -= _amount;
@@ -82,104 +77,39 @@ contract PlsJonesPlutusChef is Ownable {
       shares = 0;
     }
 
-    plsJones.transfer(msg.sender, _amount);
+    STAKING_TOKEN.transfer(msg.sender, _amount);
     emit EmergencyWithdraw(msg.sender, _amount);
   }
 
-  /**
-    Keep reward variables up to date. Ran before every mutative function.
-   */
-  function updateShares() public {
-    // if block.timestamp <= lastRewardSecond, already updated.
-    if (block.timestamp <= lastRewardSecond) {
+  function updateShares() public whenNotPaused {
+    uint _shares = shares;
+
+    if (_shares == 0) {
       return;
     }
 
-    // if pool has no supply
-    if (shares == 0) {
-      lastRewardSecond = uint32(block.timestamp);
-      return;
+    if (distro.hasBufferedRewards()) {
+      (uint _grailAmt, uint _gxpAmt) = distro.record();
+      acc_gxp_PerShare += uint128((_gxpAmt * MUL_CONSTANT) / _shares);
+      acc_grail_PerShare += uint128((_grailAmt * MUL_CONSTANT) / _shares);
     }
-
-    (uint80 pls_, uint80 plsDpx_, uint80 plsJones_, uint80 pendingJonesLessFee_) = rewardsDistro.updateInfo();
-
-    unchecked {
-      accPlsPerShare += rewardPerShare(pls_);
-      accPlsDpxPerShare += rewardPerShare(plsDpx_);
-      accPlsJonesPerShare += rewardPerShare(plsJones_);
-
-      accJonesPerShare += uint128((pendingJonesLessFee_ * MUL_CONSTANT) / shares);
-    }
-
-    rewardsDistro.harvestFromUnderlyingFarm();
-    lastRewardSecond = uint32(block.timestamp);
-  }
-
-  /** OPERATOR */
-  function depositFor(address _user, uint88 _amount) external {
-    if (msg.sender != operator) revert UNAUTHORIZED();
-    _deposit(_user, _amount);
-  }
-
-  function withdrawFor(address _user, uint88 _amount) external {
-    if (msg.sender != operator) revert UNAUTHORIZED();
-    _withdraw(_user, _amount);
-  }
-
-  function harvestFor(address _user) external {
-    if (msg.sender != operator) revert UNAUTHORIZED();
-    _harvest(_user);
   }
 
   /** VIEWS */
+  function pendingRewards(address _user) external view returns (uint _grail, uint _gxp) {
+    uint _shares = shares;
+    uint _accGxpPerShare = acc_gxp_PerShare;
+    uint _accGrailPerShare = acc_grail_PerShare;
 
-  /**
-    Calculates the reward per share since `lastRewardSecond` was updated
-  */
-  function rewardPerShare(uint80 _rewardRatePerSecond) public view returns (uint128) {
-    // duration = block.timestamp - lastRewardSecond;
-    // tokenReward = duration * _rewardRatePerSecond;
-    // tokenRewardPerShare = (tokenReward * MUL_CONSTANT) / shares;
-
-    unchecked {
-      return uint128(((block.timestamp - lastRewardSecond) * uint256(_rewardRatePerSecond) * MUL_CONSTANT) / shares);
-    }
-  }
-
-  /**
-    View function to see pending rewards on frontend
-   */
-  function pendingRewards(address _user)
-    external
-    view
-    returns (
-      uint256 _pendingPls,
-      uint256 _pendingPlsDpx,
-      uint256 _pendingPlsJones,
-      uint256 _pendingJones
-    )
-  {
-    uint256 _accPlsPerShare = accPlsPerShare;
-    uint256 _accPlsDpxPerShare = accPlsDpxPerShare;
-    uint256 _accPlsJonesPerShare = accPlsJonesPerShare;
-    uint256 _accJonesPerShare = accJonesPerShare;
-
-    (uint80 pls_, uint80 plsDpx_, uint80 plsJones_, uint80 pendingJonesLessFee_) = rewardsDistro.updateInfo();
-
-    if (block.timestamp > lastRewardSecond && shares != 0) {
-      _accPlsPerShare += rewardPerShare(pls_);
-      _accPlsDpxPerShare += rewardPerShare(plsDpx_);
-      _accPlsJonesPerShare += rewardPerShare(plsJones_);
-
-      _accJonesPerShare += uint256((pendingJonesLessFee_ * MUL_CONSTANT) / shares);
+    if (_shares != 0) {
+      (uint _grailAmt, uint _gxpAmt) = distro.pendingRewards();
+      _accGxpPerShare += uint128((_gxpAmt * MUL_CONSTANT) / _shares);
+      _accGrailPerShare += uint128((_grailAmt * MUL_CONSTANT) / _shares);
     }
 
     UserInfo memory user = userInfo[_user];
-
-    _pendingPls = _calculatePending(user.plsRewardDebt, _accPlsPerShare, user.amount);
-    _pendingPlsDpx = _calculatePending(user.plsDpxRewardDebt, _accPlsDpxPerShare, user.amount);
-    _pendingPlsJones = _calculatePending(user.plsJonesRewardDebt, _accPlsJonesPerShare, user.amount);
-    _pendingJones = _calculatePending(user.jonesRewardDebt, _accJonesPerShare, user.amount);
+    _grail = _calculatePending(user.grailRewardDebt, _accGrailPerShare, user.amount);
+    _gxp = _calculatePending(user.gxpRewardDebt, _accGxpPerShare, user.amount);
   }
 
   /** PRIVATE */
@@ -189,48 +119,34 @@ contract PlsJonesPlutusChef is Ownable {
 
   function _calculatePending(
     int128 _rewardDebt,
-    uint256 _accPerShare, // Stay 256;
+    uint256 _accTokenPerShare, // Stay 256;
     uint96 _amount
   ) private pure returns (uint128) {
     if (_rewardDebt < 0) {
-      return uint128(_calculateRewardDebt(_accPerShare, _amount)) + uint128(-_rewardDebt);
+      return uint128(_calculateRewardDebt(_accTokenPerShare, _amount)) + uint128(-_rewardDebt);
     } else {
-      return uint128(_calculateRewardDebt(_accPerShare, _amount)) - uint128(_rewardDebt);
+      return uint128(_calculateRewardDebt(_accTokenPerShare, _amount)) - uint128(_rewardDebt);
     }
   }
 
-  function _calculateRewardDebt(uint256 _accPlsPerShare, uint96 _amount) private pure returns (uint256) {
-    unchecked {
-      return (_amount * _accPlsPerShare) / MUL_CONSTANT;
-    }
-  }
-
-  function _deposit(address _user, uint96 _amount) private {
+  function _deposit(address _from, address _user, uint96 _amount) private {
     UserInfo storage user = userInfo[_user];
-    if (_amount == 0) revert DEPOSIT_ERROR();
+    if (_amount < 1e6) revert DEPOSIT_ERROR('min deposit: 0.000000000001');
     updateShares();
 
-    uint256 _prev = plsJones.balanceOf(address(this));
+    uint256 _prev = STAKING_TOKEN.balanceOf(address(this));
 
     unchecked {
       user.amount += _amount;
       shares += _amount;
     }
 
-    user.plsRewardDebt = user.plsRewardDebt + int128(uint128(_calculateRewardDebt(accPlsPerShare, _amount)));
-
-    user.plsDpxRewardDebt = user.plsDpxRewardDebt + int128(uint128(_calculateRewardDebt(accPlsDpxPerShare, _amount)));
-
-    user.plsJonesRewardDebt =
-      user.plsJonesRewardDebt +
-      int128(uint128(_calculateRewardDebt(accPlsJonesPerShare, _amount)));
-
-    user.jonesRewardDebt = user.jonesRewardDebt + int128(uint128(_calculateRewardDebt(accJonesPerShare, _amount)));
-
-    plsJones.transferFrom(_user, address(this), _amount);
+    user.grailRewardDebt += int128(uint128(_calculateRewardDebt(acc_grail_PerShare, _amount)));
+    user.gxpRewardDebt += int128(uint128(_calculateRewardDebt(acc_gxp_PerShare, _amount)));
+    STAKING_TOKEN.transferFrom(_from, address(this), _amount);
 
     unchecked {
-      if (_prev + _amount != plsJones.balanceOf(address(this))) revert DEPOSIT_ERROR();
+      if (_prev + _amount != STAKING_TOKEN.balanceOf(address(this))) revert DEPOSIT_ERROR('invariant violation');
     }
 
     emit Deposit(_user, _amount);
@@ -246,17 +162,9 @@ contract PlsJonesPlutusChef is Ownable {
       shares -= _amount;
     }
 
-    user.plsRewardDebt = user.plsRewardDebt - int128(uint128(_calculateRewardDebt(accPlsPerShare, _amount)));
-
-    user.plsDpxRewardDebt = user.plsDpxRewardDebt - int128(uint128(_calculateRewardDebt(accPlsDpxPerShare, _amount)));
-
-    user.plsJonesRewardDebt =
-      user.plsJonesRewardDebt -
-      int128(uint128(_calculateRewardDebt(accPlsJonesPerShare, _amount)));
-
-    user.jonesRewardDebt = user.jonesRewardDebt - int128(uint128(_calculateRewardDebt(accJonesPerShare, _amount)));
-
-    plsJones.transfer(_user, _amount);
+    user.grailRewardDebt -= int128(uint128(_calculateRewardDebt(acc_grail_PerShare, _amount)));
+    user.gxpRewardDebt -= int128(uint128(_calculateRewardDebt(acc_gxp_PerShare, _amount)));
+    STAKING_TOKEN.transfer(_user, _amount);
     emit Withdraw(_user, _amount);
   }
 
@@ -264,45 +172,58 @@ contract PlsJonesPlutusChef is Ownable {
     updateShares();
     UserInfo storage user = userInfo[_user];
 
-    uint128 plsPending = _calculatePending(user.plsRewardDebt, accPlsPerShare, user.amount);
+    uint _pendingGrail = _calculatePending(user.grailRewardDebt, acc_grail_PerShare, user.amount);
+    uint _pendingGxp = _calculatePending(user.gxpRewardDebt, acc_gxp_PerShare, user.amount);
 
-    uint128 plsDpxPending = _calculatePending(user.plsDpxRewardDebt, accPlsDpxPerShare, user.amount);
+    user.grailRewardDebt = int128(uint128(_calculateRewardDebt(acc_grail_PerShare, user.amount)));
+    user.gxpRewardDebt = int128(uint128(_calculateRewardDebt(acc_gxp_PerShare, user.amount)));
 
-    uint128 plsJonesPending = _calculatePending(user.plsJonesRewardDebt, accPlsJonesPerShare, user.amount);
+    distro.sendRewards(_user, _pendingGrail, _pendingGxp);
+  }
 
-    uint128 jonesPending = _calculatePending(user.jonesRewardDebt, accJonesPerShare, user.amount);
+  function _calculateRewardDebt(uint256 _accTokenPerShare, uint256 _amount) private pure returns (uint256) {
+    unchecked {
+      return (_amount * _accTokenPerShare) / MUL_CONSTANT;
+    }
+  }
 
-    user.plsRewardDebt = int128(uint128(_calculateRewardDebt(accPlsPerShare, user.amount)));
+  /** HANDLER */
+  function depositFor(address _user, uint96 _amount) external {
+    if (handlers[msg.sender] == false) revert UNAUTHORIZED();
+    _deposit(msg.sender, _user, _amount);
+  }
 
-    user.plsDpxRewardDebt = int128(uint128(_calculateRewardDebt(accPlsDpxPerShare, user.amount)));
+  function withdrawFor(address _user, uint96 _amount) external {
+    if (handlers[msg.sender] == false) revert UNAUTHORIZED();
+    _withdraw(_user, _amount);
+  }
 
-    user.plsJonesRewardDebt = int128(uint128(_calculateRewardDebt(accPlsJonesPerShare, user.amount)));
-
-    user.jonesRewardDebt = int128(uint128(_calculateRewardDebt(accJonesPerShare, user.amount)));
-
-    rewardsDistro.sendRewards(_user, plsPending, plsDpxPending, plsJonesPending, jonesPending);
+  function harvestFor(address _user) external {
+    if (handlers[msg.sender] == false) revert UNAUTHORIZED();
+    _harvest(_user);
   }
 
   /** OWNER FUNCTIONS */
+  function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+
   function setWhitelist(address _whitelist) external onlyOwner {
     whitelist = IWhitelist(_whitelist);
   }
 
-  function setOperator(address _operator) external onlyOwner {
-    operator = _operator;
+  function updateHandler(address _handler, bool _isActive) external onlyOwner {
+    handlers[_handler] = _isActive;
+    emit HandlerUpdated(_handler, _isActive);
   }
 
-  function setStartTime(uint32 _startTime) external onlyOwner {
-    if (lastRewardSecond == 0) {
-      lastRewardSecond = _startTime;
+  function setDistro(address _distro) external onlyOwner {
+    distro = IPlsJonesRewardsDistro(_distro);
+  }
+
+  function setPaused(bool _pauseContract) external onlyOwner {
+    if (_pauseContract) {
+      _pause();
+    } else {
+      _unpause();
     }
   }
-
-  error DEPOSIT_ERROR();
-  error WITHDRAW_ERROR();
-  error UNAUTHORIZED();
-
-  event Deposit(address indexed _user, uint256 _amount);
-  event Withdraw(address indexed _user, uint256 _amount);
-  event EmergencyWithdraw(address indexed _user, uint256 _amount);
 }
