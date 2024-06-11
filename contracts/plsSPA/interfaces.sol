@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.9;
+pragma solidity ^0.8.9;
 
 interface IveSPA {
   function getLastUserSlope(address addr) external view returns (int128);
