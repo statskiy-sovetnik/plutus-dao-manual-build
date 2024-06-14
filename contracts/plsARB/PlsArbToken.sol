@@ -5,6 +5,7 @@ import '@openzeppelin/contracts/token/ERC20/ERC20.sol';
 import '@openzeppelin/contracts/token/ERC20/extensions/draft-ERC20Permit.sol';
 import '@openzeppelin/contracts/access/Ownable2Step.sol';
 
+// @note find related addresses
 contract PlsArbToken is ERC20, Ownable2Step, ERC20Permit {
   address public operator;
 
