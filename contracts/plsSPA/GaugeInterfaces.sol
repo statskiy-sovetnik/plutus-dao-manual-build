@@ -81,3 +81,11 @@ interface ISpaStakerGaugeHandler {
 
   function claimAndTransferBribes() external returns (IMasterBribe.BribeRewardData[] memory rwData);
 }
+
+interface ISpaStakerGaugeHandler__ {
+  
+  function transferReward(address _token, address _to) external;
+
+  function voteForGaugeWeight(address _gAddr, uint256 _userWeight) external;
+
+}
