@@ -8,8 +8,6 @@ import '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import { IPlsRdntPlutusChef, IPlsRdntRewardsDistroV2, IRdntLpStaker, IAToken } from './Interfaces.sol';
 import { IProtocolRewardsHandler } from '../interfaces/Radiant.sol';
 
-// TODO пройтись по адресам!
-
 contract PlsRdntRewardsDistroV2 is Initializable, Ownable2StepUpgradeable, UUPSUpgradeable, IPlsRdntRewardsDistroV2 {
   address public constant CHEF = 0xaE3f67589Acb90bd2cbccD8285b37fe4F8F29042;
   uint private constant FEE_DIVISOR = 1e4;

@@ -1,0 +1,6 @@
+{
+    "exclude_informational": true,
+    "exclude_low": true,
+    "json": "slither-result.json",
+    "filter_paths": "node_modules/"
+}

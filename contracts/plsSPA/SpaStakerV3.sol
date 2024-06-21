@@ -48,7 +48,7 @@ contract SpaStakerV3 is Initializable, OwnableUpgradeable, UUPSUpgradeable, ISta
       uint256 unlockInWeeks = (unlockAt / WEEK) * WEEK;
 
       // increase time too if over 1 week buffer
-      if (unlockInWeeks - unlockTime >= 1) {
+      if (unlockInWeeks - unlockTime >= 1) { // @note неправильная логика, это вообще не число недель
         IveSPA(escrow).increaseUnlockTime(unlockAt);
         unlockTime = unlockInWeeks;
       }
